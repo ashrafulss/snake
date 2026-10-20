@@ -35,14 +35,20 @@ class SnakePage extends StatefulWidget {
   State<SnakePage> createState() => _SnakePageState();
 }
 
-class _SnakePageState extends State<SnakePage> with WidgetsBindingObserver {
+class _SnakePageState extends State<SnakePage> with WidgetsBindingObserver, TickerProviderStateMixin {
   static const int cols = 20;
   int _rows = 35; // Dynamically updated based on screen height
 
   final _rng = Random();
   Timer? _timer;
+  Timer? _bigFoodTimer; // Timer for big bonus ball expiration
+  late AnimationController _bonusAnimController; // Animation for pulsing bonus ball
+
   List<Point<int>> _snake = [];
   Point<int> _food = const Point(5, 5);
+  bool _isBigFood = false; // Tracks if current food is Big Food
+  int _extraGrowthCount = 0; // Extra squares to grow from Big Food
+
   Point<int> _dir = const Point(1, 0);
   Point<int> _next = const Point(1, 0);
   Status _status = Status.idle;
@@ -54,12 +60,27 @@ class _SnakePageState extends State<SnakePage> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _loadBest();
+
+    // Setup pulsing animation controller for the bonus ball
+    _bonusAnimController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 600),
+    )..repeat(reverse: true);
+
+    // Re-render frame on every animation tick only when big food is active
+    _bonusAnimController.addListener(() {
+      if (_isBigFood && _status == Status.playing) {
+        setState(() {});
+      }
+    });
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _timer?.cancel();
+    _bigFoodTimer?.cancel();
+    _bonusAnimController.dispose();
     super.dispose();
   }
 
@@ -81,11 +102,14 @@ class _SnakePageState extends State<SnakePage> with WidgetsBindingObserver {
   }
 
   void _start() {
+    _bigFoodTimer?.cancel();
     final startY = _rows ~/ 2;
     _snake = [Point(10, startY), Point(9, startY), Point(8, startY)];
     _dir = const Point(1, 0);
     _next = _dir;
     _score = 0;
+    _extraGrowthCount = 0;
+    _isBigFood = false;
     _spawnFood();
     setState(() => _status = Status.playing);
     _schedule();
@@ -99,20 +123,43 @@ class _SnakePageState extends State<SnakePage> with WidgetsBindingObserver {
 
   void _pause() {
     _timer?.cancel();
+    _bigFoodTimer?.cancel();
     setState(() => _status = Status.paused);
   }
 
   void _resume() {
     setState(() => _status = Status.playing);
     _schedule();
+    if (_isBigFood) {
+      _startBigFoodTimer();
+    }
   }
 
   void _spawnFood() {
+    _bigFoodTimer?.cancel();
     Point<int> p;
     do {
       p = Point(_rng.nextInt(cols), _rng.nextInt(_rows));
     } while (_snake.contains(p));
     _food = p;
+
+    _isBigFood = (_score > 0 && _score % 5 == 0 && !_isBigFood);
+
+    if (_isBigFood) {
+      _startBigFoodTimer();
+    }
+  }
+
+  void _startBigFoodTimer() {
+    _bigFoodTimer?.cancel();
+    // Big food disappears (turns back to normal red food) after 10 seconds
+    _bigFoodTimer = Timer(const Duration(seconds: 10), () {
+      if (_status == Status.playing && _isBigFood) {
+        setState(() {
+          _isBigFood = false;
+        });
+      }
+    });
   }
 
   void _tick() {
@@ -133,11 +180,21 @@ class _SnakePageState extends State<SnakePage> with WidgetsBindingObserver {
     setState(() {
       _snake.insert(0, nh);
       if (nh == _food) {
-        _score++;
+        _bigFoodTimer?.cancel();
+        if (_isBigFood) {
+          _score += 10;
+          _extraGrowthCount += 2; // Grows 3 squares total (1 normal + 2 extra)
+        } else {
+          _score += 1;
+        }
         ate = true;
         _spawnFood();
       } else {
-        _snake.removeLast();
+        if (_extraGrowthCount > 0) {
+          _extraGrowthCount--;
+        } else {
+          _snake.removeLast();
+        }
       }
     });
     if (ate) _schedule();
@@ -145,6 +202,7 @@ class _SnakePageState extends State<SnakePage> with WidgetsBindingObserver {
 
   void _gameOver() {
     _timer?.cancel();
+    _bigFoodTimer?.cancel();
     setState(() {
       _status = Status.over;
       if (_score > _best) {
@@ -157,7 +215,8 @@ class _SnakePageState extends State<SnakePage> with WidgetsBindingObserver {
   void _onTap(Offset pos, Size size) {
     if (_status != Status.playing) return;
     Point<int> want;
-    if (_next.y == 0) {
+    // Use _dir instead of _next so tap areas don't shift mid-turn
+    if (_dir.y == 0) {
       want = pos.dy < size.height / 2 ? const Point(0, -1) : const Point(0, 1);
     } else {
       want = pos.dx < size.width / 2 ? const Point(-1, 0) : const Point(1, 0);
@@ -258,7 +317,14 @@ class _SnakePageState extends State<SnakePage> with WidgetsBindingObserver {
                       fit: StackFit.expand,
                       children: [
                         CustomPaint(
-                          painter: BoardPainter(_snake, _food, cols, _rows),
+                          painter: BoardPainter(
+                            _snake,
+                            _food,
+                            cols,
+                            _rows,
+                            _isBigFood,
+                            _bonusAnimController.value,
+                          ),
                         ),
                         if (_status != Status.playing) _overlay(),
                       ],
@@ -279,8 +345,17 @@ class BoardPainter extends CustomPainter {
   final Point<int> food;
   final int cols;
   final int rows;
+  final bool isBigFood;
+  final double animationValue;
 
-  BoardPainter(this.snake, this.food, this.cols, this.rows);
+  BoardPainter(
+      this.snake,
+      this.food,
+      this.cols,
+      this.rows,
+      this.isBigFood,
+      this.animationValue,
+      );
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -297,12 +372,33 @@ class BoardPainter extends CustomPainter {
       }
     }
 
-    canvas.drawCircle(
-      Offset((food.x + 0.5) * cell, (food.y + 0.5) * cell),
-      cell * 0.38,
-      Paint()..color = Colors.redAccent,
-    );
+    // Draw Food (Animated Big Amber Food vs Normal Red Food)
+    if (isBigFood) {
+      // Pulsing radius calculation (animates smoothly between 0.65 and 0.85 of cell size)
+      final pulsingRadius = cell * (0.65 + (0.20 * animationValue));
+      final pulsingGlowRadius = cell * (0.80 + (0.25 * animationValue));
 
+      // Outer pulsing glow effect
+      canvas.drawCircle(
+        Offset((food.x + 0.5) * cell, (food.y + 0.5) * cell),
+        pulsingGlowRadius,
+        Paint()..color = Colors.amber.withOpacity(0.3 + (0.2 * animationValue)),
+      );
+      // Inner pulsing core for big food
+      canvas.drawCircle(
+        Offset((food.x + 0.5) * cell, (food.y + 0.5) * cell),
+        pulsingRadius,
+        Paint()..color = Colors.amberAccent,
+      );
+    } else {
+      canvas.drawCircle(
+        Offset((food.x + 0.5) * cell, (food.y + 0.5) * cell),
+        cell * 0.38,
+        Paint()..color = Colors.redAccent,
+      );
+    }
+
+    // Draw Snake
     for (var i = 0; i < snake.length; i++) {
       final p = snake[i];
       final rect = Rect.fromLTWH(p.x * cell, p.y * cell, cell, cell).deflate(1.5);
@@ -314,5 +410,9 @@ class BoardPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant BoardPainter old) => true;
+  bool shouldRepaint(covariant BoardPainter old) =>
+      old.isBigFood != isBigFood ||
+          old.food != food ||
+          old.snake != snake ||
+          old.animationValue != animationValue;
 }
